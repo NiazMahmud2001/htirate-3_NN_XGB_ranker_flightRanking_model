@@ -1,0 +1,96 @@
+class EnhancedRankingHeadFast(nn.Module):
+    def __init__(self, input_dim, dropout=0.1, lstm_hidden=128, cnn_channels=64, kernel_size=3):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+
+        # 1D CNN to capture local feature interactions
+        self.cnn = nn.Conv1d(
+            in_channels=input_dim, 
+            out_channels=cnn_channels, 
+            kernel_size=kernel_size, 
+            padding=1
+        )
+
+        # Bidirectional LSTM to capture sequence-level dependencies
+        self.lstm = nn.LSTM(
+            input_size=cnn_channels,
+            hidden_size=lstm_hidden,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True
+        )
+
+        # Attention gating per flight
+        #self.attention = nn.Sequential(
+        #    nn.Linear(lstm_hidden*2, lstm_hidden*2),
+        #    nn.Sigmoid()  # outputs values between 0 and 1 for gating
+        #)
+        self.attention = nn.Sequential(
+            nn.Linear(lstm_hidden*2, 64),
+            nn.Tanh(),
+            nn.Linear(64, lstm_hidden*2)  # make sure output shape matches LSTM
+        )
+
+        # Fully connected layers for final ranking score
+        self.fc = nn.Sequential(
+            nn.Linear(lstm_hidden*2, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, x):
+        # x: (batch_size, seq_len, embedding_dim)
+        x = x.transpose(1, 2)        # (batch_size, embedding_dim, seq_len) for CNN
+        x = self.cnn(x)
+        x = x.transpose(1, 2)        # (batch_size, seq_len, cnn_channels) for LSTM
+
+        lstm_out, _ = self.lstm(x)   # (batch_size, seq_len, lstm_hidden*2)
+
+        # Attention gating per flight
+        gates = self.attention(lstm_out)  # (batch_size, seq_len, lstm_hidden*2)
+        lstm_out = lstm_out * gates       # element-wise gate
+
+        # Apply FC per flight
+        scores = self.fc(lstm_out).squeeze(-1)  # (batch_size, seq_len)
+        return scores
+
+
+
+class MiniLMFlightRanker(nn.Module):
+    def __init__(self, dropout=0.1, freeze_lm=False, model_name="sentence-transformers/all-MiniLM-L6-v2"):
+        super().__init__()
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.lm = SentenceTransformer(model_name)
+        
+        # Freeze LM if needed
+        if freeze_lm:
+            for p in self.lm.parameters():
+                p.requires_grad = False
+
+        hidden_size = self.lm.get_sentence_embedding_dimension()
+        self.ranking_head = EnhancedRankingHeadFast(input_dim=hidden_size, dropout=dropout)
+
+    def forward(self, flight_texts):
+        embeddings = self.lm.encode(
+            flight_texts, 
+            convert_to_tensor=True, 
+            device=self.device,
+            show_progress_bar=False 
+        )
+        embeddings = embeddings.clone().detach().requires_grad_(True)
+        embeddings = embeddings.unsqueeze(0) 
+                
+        scores = self.ranking_head(embeddings)
+        #print(f"1. scores shape: {scores.shape}, {scores}")
+        scores = scores.squeeze(0)  # (num_flights,)
+
+        #print(f"2. len of flight_texts: {len(flight_texts)}")
+        #print(f"3. embeddings shape: {embeddings.shape}")
+        #print(f"4. scores shape after flatten: {scores.shape}, {scores}")
+        #print()
+
+        return scores  
